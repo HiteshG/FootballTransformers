@@ -29,21 +29,25 @@ class TrainingConfig:
     val_ratio: float = 0.15
     
     # Training hyperparameters
-    batch_size: int = 64              # With AMP enabled
+    batch_size: int = 32
     epochs: int = 50
-    learning_rate: float = 5e-5       # Low LR as per paper guidance
+    learning_rate: float = 5e-5
     weight_decay: float = 1e-4
     warmup_epochs: int = 3
     
     # Loss weights
     lambda_mr: float = 1.0            # Motion reconstruction weight
-    lambda_cl: float = 100.0          # Contrastive learning weight (from Hoop-MSSL)
+    lambda_cl: float = 100.0          # NT-Xent contrastive loss weight
+    lambda_triplet: float = 30.0      # Triplet loss weight
     
     # Masking
-    mask_ratio: float = 0.8           # 80% masking as per paper
+    mask_ratio: float = 0.8
     
     # Contrastive learning
     temperature: float = 0.5          # NT-Xent temperature
+    
+    # Triplet loss
+    triplet_margin: float = 0.3       # Margin for triplet loss
     
     # Logging
     log_every_n_steps: int = 50

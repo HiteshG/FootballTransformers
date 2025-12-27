@@ -1,17 +1,16 @@
 """
 SoccerTransformer Trainer
-- Training loop with gradient accumulation
-- Validation with metrics
-- Learning rate scheduling
-- Checkpointing
-- Comprehensive logging
+- Training with in-batch contrastive learning
+- Triplet loss with in-batch semi-hard mining
+- No queue or momentum encoder
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
-from typing import Dict, Optional
+from typing import Dict
 import time
 import os
 import json
@@ -19,12 +18,12 @@ from collections import defaultdict
 
 from config import Config
 from model import SoccerTransformer
-from losses import CombinedLoss, check_embedding_collapse
+from losses import CombinedLoss, ReconstructionLoss, check_embedding_collapse
 
 
 class Trainer:
     """
-    Trainer for SoccerTransformer model.
+    Trainer for SoccerTransformer with in-batch contrastive learning and triplet loss.
     """
     
     def __init__(
@@ -49,7 +48,9 @@ class Trainer:
         self.criterion = CombinedLoss(
             lambda_mr=config.training.lambda_mr,
             lambda_cl=config.training.lambda_cl,
-            temperature=config.training.temperature
+            lambda_triplet=config.training.lambda_triplet,
+            temperature=config.training.temperature,
+            triplet_margin=config.training.triplet_margin,
         )
         
         # Optimizer
@@ -59,9 +60,8 @@ class Trainer:
             weight_decay=config.training.weight_decay
         )
         
-        # Learning rate scheduler: warmup + cosine annealing
+        # Learning rate scheduler
         warmup_steps = config.training.warmup_epochs * len(train_loader)
-        total_steps = config.training.epochs * len(train_loader)
         
         warmup_scheduler = LinearLR(
             self.optimizer,
@@ -72,7 +72,7 @@ class Trainer:
         
         cosine_scheduler = CosineAnnealingWarmRestarts(
             self.optimizer,
-            T_0=len(train_loader),  # Restart every epoch
+            T_0=len(train_loader),
             T_mult=2,
             eta_min=config.training.learning_rate * 0.01
         )
@@ -108,10 +108,8 @@ class Trainer:
             features = batch['features'].to(self.device)
             mask_anchor = batch['mask_anchor'].to(self.device)
             mask_positive = batch['mask_positive'].to(self.device)
-            features_negative = batch['features_negative'].to(self.device)
-            mask_negative = batch['mask_negative'].to(self.device)
             
-            # Ground truth for reconstruction (x_norm, y_norm are first 2 features)
+            # Ground truth for reconstruction
             targets = features[:, :, :, :2]  # [B, A, T, 2]
             
             self.optimizer.zero_grad()
@@ -132,17 +130,17 @@ class Trainer:
                     mask_anchor=mask_anchor,
                     mask_positive=mask_positive,
                     embed_anchor=out_anchor['embedding'],
-                    embed_positive=out_positive['embedding']
+                    embed_positive=out_positive['embedding'],
                 )
             
             # Backward pass with scaler
             self.scaler.scale(loss).backward()
             
-            # Gradient clipping (unscale first)
+            # Gradient clipping
             self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             
-            # Optimizer step with scaler
+            # Optimizer step
             self.scaler.step(self.optimizer)
             self.scaler.update()
             
@@ -163,14 +161,14 @@ class Trainer:
                       f"Loss: {metrics['loss_total']:.4f} | "
                       f"MR: {metrics['loss_mr']:.4f} | "
                       f"CL: {metrics['loss_cl']:.4f} | "
+                      f"Tri: {metrics['loss_triplet']:.4f} | "
                       f"Acc: {metrics['contrastive_accuracy']:.3f} | "
                       f"LR: {self.scheduler.get_last_lr()[0]:.2e} | "
-                      f"Speed: {samples_per_sec:.1f} samples/s")
+                      f"Speed: {samples_per_sec:.1f} s/s")
                 
                 # Check for embedding collapse
                 if check_embedding_collapse(metrics['embedding_std']):
-                    print("  ⚠️ WARNING: Embedding collapse detected! Std={:.4f}".format(
-                        metrics['embedding_std']))
+                    print(f"  ⚠️ WARNING: Embedding collapse detected! Std={metrics['embedding_std']:.4f}")
         
         # Average metrics
         for k in epoch_metrics:
@@ -195,18 +193,12 @@ class Trainer:
             mask = batch['mask'].to(self.device)
             targets = features[:, :, :, :2]
             
-            # Forward pass with mixed precision
             with torch.cuda.amp.autocast(enabled=self.use_amp):
                 out = self.model(features, mask)
-                
-                # Reconstruction loss only (no contrastive for validation)
-                from losses import ReconstructionLoss
                 mr_loss = ReconstructionLoss()(out['reconstructed'], targets, mask)
             
             epoch_metrics['loss_mr'] += mr_loss.item()
-            
-            # Collect embeddings for analysis
-            all_embeddings.append(out['embedding'].float().cpu())  # Convert to float32 for analysis
+            all_embeddings.append(out['embedding'].float().cpu())
             num_batches += 1
         
         # Average metrics
@@ -218,9 +210,9 @@ class Trainer:
         epoch_metrics['embedding_std'] = all_embeddings.std(dim=0).mean().item()
         epoch_metrics['embedding_mean_norm'] = all_embeddings.mean(dim=0).norm().item()
         
-        # Intra-batch similarity distribution
+        # Similarity distribution
         sample_idx = torch.randperm(len(all_embeddings))[:min(1000, len(all_embeddings))]
-        sample_embeds = all_embeddings[sample_idx]
+        sample_embeds = F.normalize(all_embeddings[sample_idx], dim=1)
         sim_matrix = torch.mm(sample_embeds, sample_embeds.t())
         mask = ~torch.eye(len(sample_embeds), dtype=torch.bool)
         epoch_metrics['mean_similarity'] = sim_matrix[mask].mean().item()
@@ -281,8 +273,11 @@ class Trainer:
         print(f"Batch size: {self.config.training.batch_size}")
         print(f"Epochs: {self.config.training.epochs}")
         print(f"Learning rate: {self.config.training.learning_rate}")
+        print("-" * 70)
         print(f"Lambda MR: {self.config.training.lambda_mr}")
         print(f"Lambda CL: {self.config.training.lambda_cl}")
+        print(f"Lambda Triplet: {self.config.training.lambda_triplet}")
+        print(f"Triplet margin: {self.config.training.triplet_margin}")
         print("=" * 70)
         
         for epoch in range(self.current_epoch, self.config.training.epochs):
@@ -301,10 +296,12 @@ class Trainer:
             print(f"    Loss Total: {train_metrics['loss_total']:.4f}")
             print(f"    Loss MR: {train_metrics['loss_mr']:.4f} (weighted: {train_metrics['loss_mr_weighted']:.4f})")
             print(f"    Loss CL: {train_metrics['loss_cl']:.4f} (weighted: {train_metrics['loss_cl_weighted']:.4f})")
+            print(f"    Loss Triplet: {train_metrics['loss_triplet']:.4f} (weighted: {train_metrics['loss_triplet_weighted']:.4f})")
             print(f"    Contrastive Accuracy: {train_metrics['contrastive_accuracy']:.3f}")
             print(f"    Positive Similarity: {train_metrics['positive_similarity']:.3f}")
             print(f"    Negative Similarity: {train_metrics['negative_similarity']:.3f}")
             print(f"    Embedding Std: {train_metrics['embedding_std']:.4f}")
+            print(f"    Valid Triplets: {train_metrics['num_valid_triplets']:.0f}")
             print(f"    Epoch Time: {train_metrics['epoch_time']:.1f}s")
             
             # Validation
