@@ -100,15 +100,17 @@ def train():
         training=TrainingConfig(
             train_ratio=0.85,
             val_ratio=0.15,
-            batch_size=32,            # With AMP enabled
+            batch_size=32,
             epochs=50,
             learning_rate=5e-5,
             weight_decay=1e-4,
             warmup_epochs=3,
             lambda_mr=1.0,
             lambda_cl=100.0,
+            lambda_triplet=30.0,
             mask_ratio=0.8,
             temperature=0.5,
+            triplet_margin=0.3,
             log_every_n_steps=50,
             val_every_n_epochs=1,
             save_every_n_epochs=5,
@@ -146,6 +148,7 @@ def train():
     print(f"Total parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
     print(f"Mixed precision (AMP): ENABLED")
+    print(f"Triplet loss: ENABLED (margin={config.training.triplet_margin})")
     
     # Create trainer
     trainer = Trainer(
