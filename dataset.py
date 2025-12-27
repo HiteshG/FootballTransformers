@@ -31,12 +31,20 @@ class SoccerTrackingDataset(Dataset):
         # Feature columns
         self.feature_cols = list(config.data.feature_columns)
         
-        # Build window index
-        self.window_ids = df[config.data.window_column].unique()
-        self.window_to_match = df.groupby(config.data.window_column)[config.data.match_column].first().to_dict()
+        # Build window index (string IDs)
+        self.global_window_ids = df[config.data.window_column].unique().tolist()
+        self.global_window_to_match = df.groupby(config.data.window_column)[config.data.match_column].first().to_dict()
         
         # Build match to windows mapping for contrastive sampling
-        self.match_to_windows = df.groupby(config.data.match_column)[config.data.window_column].unique().to_dict()
+        self.match_to_global_windows = {
+            k: v.tolist() for k, v in 
+            df.groupby(config.data.match_column)[config.data.window_column].unique().items()
+        }
+        
+        # Create string to index mappings for returning integer IDs
+        self.global_window_id_to_idx = {wid: idx for idx, wid in enumerate(self.global_window_ids)}
+        self.match_ids = list(self.match_to_global_windows.keys())
+        self.match_id_to_idx = {mid: idx for idx, mid in enumerate(self.match_ids)}
         
         # Preprocess data into tensors per window
         self.windows_data = self._preprocess_windows(df)
@@ -79,13 +87,13 @@ class SoccerTrackingDataset(Dataset):
         """Create random mask with specified ratio. True = masked (to predict)."""
         return torch.rand(shape) < self.mask_ratio
     
-    def _get_contrastive_pair_window_id(self, window_id: int) -> Optional[int]:
+    def _get_contrastive_pair_global_window_id(self, global_window_id: str) -> Optional[str]:
         """Get a different window from the same match for hard negative mining."""
-        match_id = self.window_to_match[window_id]
-        match_windows = self.match_to_windows[match_id]
+        match_id = self.global_window_to_match[global_window_id]
+        match_windows = self.match_to_global_windows[match_id]
         
         # Filter out current window
-        other_windows = [w for w in match_windows if w != window_id and w in self.windows_data]
+        other_windows = [w for w in match_windows if w != global_window_id and w in self.windows_data]
         
         if len(other_windows) == 0:
             return None
@@ -93,10 +101,15 @@ class SoccerTrackingDataset(Dataset):
         return np.random.choice(other_windows)
     
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        window_id = list(self.windows_data.keys())[idx]
-        features = self.windows_data[window_id].clone()  # [23, 100, 6]
+        global_window_id = self.global_window_ids[idx]  # String ID
+        features = self.windows_data[global_window_id].clone()  # [23, 100, 6]
         
         A, T, D = features.shape
+        
+        # Get integer indices for window and match
+        global_window_idx = self.global_window_id_to_idx[global_window_id]
+        match_id = self.global_window_to_match[global_window_id]
+        match_idx = self.match_id_to_idx[match_id]
         
         if self.is_training:
             # Create two different random masks for contrastive learning
@@ -104,9 +117,9 @@ class SoccerTrackingDataset(Dataset):
             mask_positive = self._create_random_mask((A, T))
             
             # Get contrastive negative from same match, different window
-            neg_window_id = self._get_contrastive_pair_window_id(window_id)
-            if neg_window_id is not None:
-                features_negative = self.windows_data[neg_window_id].clone()
+            neg_global_window_id = self._get_contrastive_pair_global_window_id(global_window_id)
+            if neg_global_window_id is not None:
+                features_negative = self.windows_data[neg_global_window_id].clone()
                 mask_negative = self._create_random_mask((A, T))
             else:
                 # Fallback: use same window with very different mask
@@ -119,8 +132,8 @@ class SoccerTrackingDataset(Dataset):
                 'mask_positive': mask_positive,          # [23, 100]
                 'features_negative': features_negative,  # [23, 100, 6]
                 'mask_negative': mask_negative,          # [23, 100]
-                'window_id': torch.tensor(window_id),
-                'match_id': torch.tensor(self.window_to_match[window_id]),
+                'global_window_idx': torch.tensor(global_window_idx, dtype=torch.long),
+                'match_idx': torch.tensor(match_idx, dtype=torch.long),
             }
         else:
             # Validation: single mask
@@ -128,8 +141,8 @@ class SoccerTrackingDataset(Dataset):
             return {
                 'features': features,
                 'mask': mask,
-                'window_id': torch.tensor(window_id),
-                'match_id': torch.tensor(self.window_to_match[window_id]),
+                'global_window_idx': torch.tensor(global_window_idx, dtype=torch.long),
+                'match_idx': torch.tensor(match_idx, dtype=torch.long),
             }
 
 

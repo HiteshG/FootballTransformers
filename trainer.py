@@ -41,6 +41,10 @@ class Trainer:
         self.config = config
         self.device = device
         
+        # Mixed precision scaler
+        self.scaler = torch.cuda.amp.GradScaler()
+        self.use_amp = device.type == 'cuda'
+        
         # Loss function
         self.criterion = CombinedLoss(
             lambda_mr=config.training.lambda_mr,
@@ -110,31 +114,38 @@ class Trainer:
             # Ground truth for reconstruction (x_norm, y_norm are first 2 features)
             targets = features[:, :, :, :2]  # [B, A, T, 2]
             
-            # Forward pass - anchor view
-            out_anchor = self.model(features, mask_anchor)
-            
-            # Forward pass - positive view (same data, different mask)
-            out_positive = self.model(features, mask_positive)
-            
-            # Compute loss
-            loss, metrics = self.criterion(
-                pred_anchor=out_anchor['reconstructed'],
-                pred_positive=out_positive['reconstructed'],
-                targets=targets,
-                mask_anchor=mask_anchor,
-                mask_positive=mask_positive,
-                embed_anchor=out_anchor['embedding'],
-                embed_positive=out_positive['embedding']
-            )
-            
-            # Backward pass
             self.optimizer.zero_grad()
-            loss.backward()
             
-            # Gradient clipping
+            # Forward pass with mixed precision
+            with torch.cuda.amp.autocast(enabled=self.use_amp):
+                # Forward pass - anchor view
+                out_anchor = self.model(features, mask_anchor)
+                
+                # Forward pass - positive view (same data, different mask)
+                out_positive = self.model(features, mask_positive)
+                
+                # Compute loss
+                loss, metrics = self.criterion(
+                    pred_anchor=out_anchor['reconstructed'],
+                    pred_positive=out_positive['reconstructed'],
+                    targets=targets,
+                    mask_anchor=mask_anchor,
+                    mask_positive=mask_positive,
+                    embed_anchor=out_anchor['embedding'],
+                    embed_positive=out_positive['embedding']
+                )
+            
+            # Backward pass with scaler
+            self.scaler.scale(loss).backward()
+            
+            # Gradient clipping (unscale first)
+            self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             
-            self.optimizer.step()
+            # Optimizer step with scaler
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            
             self.scheduler.step()
             
             # Accumulate metrics
@@ -184,17 +195,18 @@ class Trainer:
             mask = batch['mask'].to(self.device)
             targets = features[:, :, :, :2]
             
-            # Forward pass
-            out = self.model(features, mask)
-            
-            # Reconstruction loss only (no contrastive for validation)
-            from losses import ReconstructionLoss
-            mr_loss = ReconstructionLoss()(out['reconstructed'], targets, mask)
+            # Forward pass with mixed precision
+            with torch.cuda.amp.autocast(enabled=self.use_amp):
+                out = self.model(features, mask)
+                
+                # Reconstruction loss only (no contrastive for validation)
+                from losses import ReconstructionLoss
+                mr_loss = ReconstructionLoss()(out['reconstructed'], targets, mask)
             
             epoch_metrics['loss_mr'] += mr_loss.item()
             
             # Collect embeddings for analysis
-            all_embeddings.append(out['embedding'].cpu())
+            all_embeddings.append(out['embedding'].float().cpu())  # Convert to float32 for analysis
             num_batches += 1
         
         # Average metrics

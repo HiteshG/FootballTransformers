@@ -29,7 +29,7 @@ class TrainingConfig:
     val_ratio: float = 0.15
     
     # Training hyperparameters
-    batch_size: int = 64
+    batch_size: int = 64              # With AMP enabled
     epochs: int = 50
     learning_rate: float = 5e-5       # Low LR as per paper guidance
     weight_decay: float = 1e-4

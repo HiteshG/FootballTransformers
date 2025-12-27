@@ -100,7 +100,7 @@ def train():
         training=TrainingConfig(
             train_ratio=0.85,
             val_ratio=0.15,
-            batch_size=64,
+            batch_size=32,            # With AMP enabled
             epochs=50,
             learning_rate=5e-5,
             weight_decay=1e-4,
@@ -145,6 +145,7 @@ def train():
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Total parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
+    print(f"Mixed precision (AMP): ENABLED")
     
     # Create trainer
     trainer = Trainer(
